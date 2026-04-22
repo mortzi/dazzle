@@ -1,0 +1,27 @@
+# Build artifacts
+target/
+build/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+
+# Version Control
+.git
+.gitignore
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# OS specific files
+.DS_Store
+Thumbs.db

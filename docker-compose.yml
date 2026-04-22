@@ -1,0 +1,12 @@
+services:
+  app:
+    container_name: dazzle-api
+    build:
+      context: .
+      args:
+        - PORT=${SERVICE_PORT}
+    ports:
+      - "${SERVICE_PORT}:${SERVICE_PORT}"
+    env_file:
+      - .env
+    restart: unless-stopped
