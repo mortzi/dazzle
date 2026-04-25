@@ -1,6 +1,7 @@
-use crate::common::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
+
+use crate::common::error::{AppError, AppResult};
 
 #[derive(Debug, Serialize)]
 pub struct Request {
@@ -102,4 +103,54 @@ pub struct Ticker {
     pub current_funding: f64,
     pub funding_8h: f64,
     pub stats: TickerStats,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OrderBook {
+    pub instrument_name: String,
+    pub timestamp: u64,
+    pub state: String,
+    pub change_id: u64,
+    pub bids: Vec<[f64; 2]>, // [price, amount]
+    pub asks: Vec<[f64; 2]>, // [price, amount]
+    pub mark_price: f64,
+    pub index_price: f64,
+    pub last_price: f64,
+    pub best_bid_price: f64,
+    pub best_bid_amount: f64,
+    pub best_ask_price: f64,
+    pub best_ask_amount: f64,
+    pub open_interest: f64,
+    pub min_price: f64,
+    pub max_price: f64,
+    pub settlement_price: f64,
+    pub current_funding: f64,
+    pub funding_8h: f64,
+}
+
+// ! not yet checked !
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum BookUpdateType {
+    Snapshot,
+    Change,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BookLevel {
+    pub action: String, // "new", "change", "delete"
+    pub price: f64,
+    pub amount: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OrderBookUpdate {
+    pub instrument_name: String,
+    pub timestamp: u64,
+    pub change_id: u64,
+    pub prev_change_id: Option<u64>, // None on snapshot
+    #[serde(rename = "type")]
+    pub update_type: BookUpdateType,
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
 }

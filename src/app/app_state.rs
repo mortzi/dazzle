@@ -1,17 +1,19 @@
-use crate::common::config::Config;
-use crate::deribit::service::DeribitService;
 use std::sync::Arc;
+
+use crate::{
+    common::config::Config, deribit::client::DeribitClient,
+};
 
 pub struct AppState {
     pub config: Config,
-    pub deribit_service: Arc<DeribitService>,
+    pub deribit_client: Arc<DeribitClient>,
 }
 
 impl AppState {
-    pub fn new(config: Config, deribit_service: Arc<DeribitService>) -> Self {
+    pub fn new(config: Config, deribit_client: Arc<DeribitClient>) -> Self {
         Self {
             config,
-            deribit_service,
+            deribit_client,
         }
     }
 }

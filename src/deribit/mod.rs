@@ -1,4 +1,5 @@
-pub mod service;
-pub mod models;
+pub mod client;
 pub mod connection;
-pub mod ticker_stream;
+pub mod models;
+pub mod subscription_stream;
+pub mod channel_name;

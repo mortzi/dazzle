@@ -1,7 +1,6 @@
 use dazzle::app::bootstrap::create_app;
 use reqwest::Client;
-use tokio::net::TcpListener;
-use tokio::task::JoinSet;
+use tokio::{net::TcpListener, task::JoinSet};
 use tracing::info;
 
 #[tokio::main]
@@ -13,9 +12,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let (app, _app_state) = create_app().await?;
 
-    tokio::spawn(async move {
+    let serve_handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
+    let _ = scopeguard::guard(serve_handle, |h| h.abort());
 
     info!("Server running at {base_url}");
 

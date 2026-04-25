@@ -1,15 +1,23 @@
-use crate::common::error::{AppError, AppResult};
-use crate::deribit::models::Request;
+use std::time::Duration;
+
 use backoff::backoff::Backoff;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
-use tracing::{debug, error, info, warn};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message, Utf8Bytes},
+};
+use tracing::{debug, error, info, trace, warn};
+
+use crate::{
+    common::error::{AppError, AppResult},
+    deribit::models::Request,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionState {
@@ -19,7 +27,7 @@ pub enum ConnectionState {
     Failed,
 }
 
-pub struct WsManager {
+pub struct ConnectionManager {
     task: JoinHandle<()>,
     state_tx: watch::Sender<ConnectionState>,
 
@@ -28,7 +36,7 @@ pub struct WsManager {
     pub receiver: mpsc::Receiver<Utf8Bytes>,
 }
 
-struct WsRunner {
+struct ConnectionRunner {
     url: String,
     state_tx: watch::Sender<ConnectionState>,
     inbound_tx: mpsc::Sender<Utf8Bytes>,    // WS → app
@@ -40,13 +48,13 @@ enum DisconnectReason {
     Shutdown,       // app dropped outbound_tx, stop cleanly
 }
 
-impl WsManager {
+impl ConnectionManager {
     pub async fn connect(url: String) -> AppResult<Self> {
         let (outbound_tx, outbound_rx) = mpsc::channel::<Utf8Bytes>(32);
         let (inbound_tx, inbound_rx) = mpsc::channel::<Utf8Bytes>(32);
         let (state_tx, mut state_rx) = watch::channel(ConnectionState::Stopped);
 
-        let runner = WsRunner {
+        let runner = ConnectionRunner {
             url,
             state_tx: state_tx.clone(),
             inbound_tx,
@@ -86,7 +94,7 @@ impl WsManager {
     }
 }
 
-impl WsRunner {
+impl ConnectionRunner {
     async fn maintain_connection(mut self) {
         let mut backoff = backoff::ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_millis(500))
@@ -97,7 +105,7 @@ impl WsRunner {
 
         loop {
             let _ = self.state_tx.send(ConnectionState::Connecting);
-            info!("WebSocket connecting to {}", &self.url);
+            debug!("WebSocket connecting to {}", &self.url);
 
             match connect_async(&self.url).await {
                 Err(e) => {
@@ -134,11 +142,11 @@ impl WsRunner {
     ) -> DisconnectReason {
         let (mut sink, mut stream) = ws.split();
 
-        let msg = Request::new(0, "public/set_heartbeat", json!({ "interval": 30 }))
+        let heartbeat_msg = Request::new(0, "public/set_heartbeat", json!({ "interval": 30 }))
             .to_utf8bytes()
             .unwrap();
 
-        if sink.send(Message::Text(msg)).await.is_err() {
+        if sink.send(Message::Text(heartbeat_msg)).await.is_err() {
             return DisconnectReason::ConnectionLost;
         }
 
@@ -146,42 +154,56 @@ impl WsRunner {
             tokio::select! {
                 msg = stream.next() => {
                     match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            info!(preview = &text[0..text.len().min(100)], "WS inbound");
-                            if self.inbound_tx.send(text).await.is_err() {
-                                // app dropped inbound_rx, no point continuing
-                                return DisconnectReason::Shutdown;
+                        Some(some_msg) => match some_msg {
+                            Ok(ok_msg) => match ok_msg {
+                                Message::Text(text) => {
+                                    trace!(preview = &text[0..text.len()], "WS inbound");
+                                    if self.inbound_tx.send(text).await.is_err() {
+                                        // app dropped inbound_rx, no point continuing
+                                        return DisconnectReason::Shutdown;
+                                    }
+                                }
+                                Message::Ping(data) => {
+                                    sink.send(Message::Pong(data))
+                                    .await
+                                    .unwrap_or_else(|e| error!("WS ping error: {}", e));
+                                }
+                                Message::Close(frame) => {
+                                    if let Some(f) = frame {
+                                        warn!("WS connection closed: {} (code: {})", f.reason, f.code);
+                                    } else {
+                                        warn!("WS connection closed without reason");
+                                    }
+                                    return DisconnectReason::ConnectionLost;
+                                }
+                                _ => {
+                                    warn!("Unexpected WS message: {:?}", ok_msg);
+                                }
+                            },
+                            Err(e) => {
+                                error!("WS read error: {}", e);
+                                return DisconnectReason::ConnectionLost;
                             }
-                        }
-                        Some(Ok(Message::Ping(data))) => {
-                            let _ = sink.send(Message::Pong(data)).await;
-                        }
-                        Some(Ok(Message::Close(frame))) => {
-                            if let Some(f) = frame {
-                                info!("WS connection closed: {} (code: {})", f.reason, f.code);
-                            } else {
-                                info!("WS connection closed without reason");
-                            }
-                            return DisconnectReason::ConnectionLost;
                         },
-                        Some(Err(e)) => {
-                            error!("WS read error: {}", e);
+                        None => {
+                            debug!("WS message of None received, closing the connection");
                             return DisconnectReason::ConnectionLost;
                         }
-                        None => return DisconnectReason::ConnectionLost,
-                        _ => {}
                     }
                 }
                 msg = self.outbound_rx.recv() => {
                     match msg {
                         Some(text) => {
-                            info!(preview = &text[0..text.len().min(100)], "WS outbound");
+                            trace!(preview = &text[0..text.len()], "WS outbound");
                             if let Err(e) = sink.send(Message::Text(text)).await {
                                 error!("WS write error: {}", e);
                                 return DisconnectReason::ConnectionLost;
                             }
                         }
-                        None => return DisconnectReason::Shutdown,
+                        None => {
+                            debug!("Outbound channel receiver closed, closing the connection");
+                            return DisconnectReason::Shutdown;
+                        },
                     }
                 }
             }
