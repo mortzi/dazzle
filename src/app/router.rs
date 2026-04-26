@@ -8,23 +8,20 @@ use axum::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::get,
+    routing::{get, post},
 };
 use futures::Stream;
-use tokio_stream::{
-    StreamExt,
-    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
-};
+use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
     app::{app_state::AppState, models::BookQuery},
     common::error::{AppError, AppResult},
     deribit::{
-        channel_name::ChannelName,
-        models::{Instrument, OrderBook, OrderBookUpdate, Ticker},
+        channel::Channel,
+        models::{Instrument, Ticker},
     },
     order_book::{book::Book, book_manager::BookManager},
 };
@@ -35,6 +32,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/instruments", get(get_instruments))
         .route("/ticker/{instrument_name}", get(get_ticker))
         .route("/ticker/{instrument_name}/stream", get(stream_ticker))
+        .route("/start-book/{instrument_name}", post(start_book))
+        .route("/stop-book/{instrument_name}", post(stop_book))
         .route("/book/{instrument_name}", get(get_book))
         .route("/book/{instrument_name}/stream", get(stream_book))
         .fallback(fallback)
@@ -63,7 +62,7 @@ async fn stream_ticker(
 
     let stream = state
         .deribit_client
-        .subscribe_ticker(&ChannelName::ticker(&instrument_name), Uuid::new_v4())
+        .subscribe_ticker(&Channel::ticker(&instrument_name), Uuid::new_v4())
         .await?
         .map(|result| {
             result.and_then(|item| {
@@ -79,16 +78,45 @@ async fn stream_ticker(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+async fn start_book(
+    State(state): State<Arc<AppState>>,
+    Path(instrument_name): Path<String>,
+) -> AppResult<Json<()>> {
+    let channel = Channel::book(&instrument_name);
+    info!(%channel, "Starting order book");
+    if state.order_book_managers.contains_key(&channel) {
+        return Ok(Json(()));
+    }
+    let book_manager =
+        Arc::new(BookManager::new(Arc::clone(&state.deribit_client), channel.clone()).await?);
+
+    state.order_book_managers.insert(channel, book_manager);
+
+    Ok(Json(()))
+}
+
+async fn stop_book(
+    State(state): State<Arc<AppState>>,
+    Path(instrument_name): Path<String>,
+) -> AppResult<Json<()>> {
+    let channel = Channel::book(&instrument_name);
+    info!(%channel, "Stopping order book");
+    if let Some(_) = state.order_book_managers.remove(&channel) {
+        info!(%channel, "Order book stopped");
+    }
+    Ok(Json(()))
+}
+
 async fn get_book(
     State(state): State<Arc<AppState>>,
     Path(instrument_name): Path<String>,
     Query(query): Query<BookQuery>,
 ) -> AppResult<Json<Book>> {
-    info!(instrument_name, "Fetching order book");
-    let channel = ChannelName::book(&instrument_name);
+    let channel = Channel::book(&instrument_name);
+    info!(%channel, "Fetching order book");
 
     let manager = BookManager::new(Arc::clone(&state.deribit_client), channel).await?;
-    let book = manager.get_book().read().await.clone();
+    let book = manager.get_book().await;
     debug!("Waiting 5 sec to update order book");
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     debug!("Returning order book");
@@ -99,13 +127,26 @@ async fn stream_book(
     State(state): State<Arc<AppState>>,
     Path(instrument_name): Path<String>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, AppError>>>> {
-    info!(instrument_name, "Streaming order book");
+    let channel = Channel::book(&instrument_name);
+    let connection_id = Uuid::new_v4();
+    info!(%channel, %connection_id, "Streaming order book");
 
-    let stream = state
-        .deribit_client
-        .subscribe_order_book(&ChannelName::book(&instrument_name), Uuid::new_v4())
-        .await?
-        .map(|result| {
+    let book_manager = match state.order_book_managers.get(&channel) {
+        Some(manager) => Arc::clone(&*manager),
+        None => {
+            let manager = Arc::new(
+                BookManager::new(Arc::clone(&state.deribit_client), channel.clone()).await?,
+            );
+            state
+                .order_book_managers
+                .insert(channel, Arc::clone(&manager));
+            manager
+        }
+    };
+
+    let stream = book_manager
+        .subscribe_book(connection_id)?
+        .map(move |result| {
             result.and_then(|item| {
                 Event::default().json_data(item).map_err(|e| {
                     AppError::InternalError(format!(

@@ -10,19 +10,24 @@ use tokio_stream::{
     StreamExt,
     wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     common::error::AppError,
-    deribit::{channel_name::ChannelName, client::DeribitClient},
+    deribit::{channel::Channel, client::DeribitClient},
 };
+
+pub enum OnDrop {
+    Unsubscribe { client: Arc<DeribitClient> },
+    KeepAlive,
+}
 
 pub struct SubscriptionStream<T> {
     pub connection_id: Uuid,
-    pub channel: ChannelName,
+    pub channel: Channel,
     inner: Pin<Box<dyn Stream<Item = Result<T, AppError>> + Send>>,
-    client: Arc<DeribitClient>,
+    on_drop: OnDrop,
 }
 
 impl<T> SubscriptionStream<T>
@@ -31,9 +36,9 @@ where
 {
     pub fn new(
         rx: broadcast::Receiver<T>,
-        channel: ChannelName,
-        client: Arc<DeribitClient>,
+        channel: Channel,
         connection_id: Uuid,
+        on_drop: OnDrop,
         filter: impl Fn(&T) -> bool + Send + Sync + 'static,
     ) -> Self
     where
@@ -53,8 +58,8 @@ where
         Self {
             inner: Box::pin(inner),
             channel,
-            client,
             connection_id,
+            on_drop,
         }
     }
 }
@@ -69,17 +74,21 @@ impl<T> Stream for SubscriptionStream<T> {
 
 impl<T> Drop for SubscriptionStream<T> {
     fn drop(&mut self) {
-        info!(connection_id = %self.connection_id, channel = %&self.channel, "Dropping stream");
-        let client = Arc::clone(&self.client);
-        let channel = self.channel.clone();
-        let connection_id = self.connection_id;
-        tokio::spawn(async move {
-            match client.unsubscribe(channel).await {
-                Ok(()) => info!(connection_id = %connection_id, "Unsubscribed from stream"),
-                Err(e) => {
-                    error!(connection_id = %connection_id, "Failed to unsubscribe from stream: {}", e)
+        debug!(connection_id = %self.connection_id, channel = %&self.channel, "Dropping stream");
+
+        if let OnDrop::Unsubscribe { client } = &self.on_drop {
+            debug!(connection_id = %self.connection_id, channel = %&self.channel, "Unsubscribing from stream");
+            let client = Arc::clone(client);
+            let channel = self.channel.clone();
+            let connection_id = self.connection_id;
+            tokio::spawn(async move {
+                match client.unsubscribe(channel).await {
+                    Ok(()) => info!(connection_id = %connection_id, "Unsubscribed from stream"),
+                    Err(e) => {
+                        error!(connection_id = %connection_id, "Failed to unsubscribe from stream: {}", e)
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 }

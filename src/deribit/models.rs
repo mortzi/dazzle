@@ -140,7 +140,7 @@ pub enum BookUpdateType {
 pub struct BookLevel {
     pub action: String, // "new", "change", "delete"
     pub price: f64,
-    pub amount: f64,
+    pub size: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

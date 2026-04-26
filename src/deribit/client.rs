@@ -7,7 +7,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
@@ -20,10 +20,10 @@ use uuid::Uuid;
 use crate::{
     common::error::{AppError, AppResult},
     deribit::{
-        channel_name::ChannelName,
+        channel::Channel,
         connection::ConnectionManager,
         models::{Instrument, OrderBook, OrderBookUpdate, Request, Response, Ticker},
-        subscription_stream::SubscriptionStream,
+        subscription_stream::{OnDrop, SubscriptionStream},
     },
 };
 
@@ -31,7 +31,7 @@ pub struct DeribitClient {
     sender: mpsc::Sender<Utf8Bytes>,
     request_id: Arc<AtomicU64>,
     pending_requests: Arc<DashMap<u64, oneshot::Sender<Utf8Bytes>>>,
-    subscribed_channels: DashMap<String, AtomicU32>,
+    subscribed_channels: DashMap<Channel, AtomicU32>,
     tickers_tx: broadcast::Sender<Ticker>,
     book_change_tx: broadcast::Sender<OrderBookUpdate>,
     _dispatch_loop_task: JoinHandle<()>,
@@ -103,20 +103,30 @@ impl DeribitClient {
                     match channel.split('.').next() {
                         Some("ticker") => match serde_json::from_value::<Ticker>(data_params) {
                             Ok(ticker) => {
-                                let _ = tickers_tx.send(ticker);
+                                tickers_tx
+                                    .send(ticker)
+                                    .inspect_err(|e| {
+                                        warn!(%channel, "Failed to broadcast ticker update: {}", e)
+                                    })
+                                    .ok();
                             }
-                            Err(e) => warn!("Failed to parse ticker: {}", e),
+                            Err(e) => warn!(%channel, "Failed to parse ticker: {}", e),
                         },
                         Some("book") => {
                             match serde_json::from_value::<OrderBookUpdate>(data_params) {
-                                Ok(ticker) => {
-                                    let _ = book_change_tx.send(ticker);
+                                Ok(book) => {
+                                    book_change_tx
+                                        .send(book)
+                                        .inspect_err(|e| {
+                                            warn!(%channel, "Failed to broadcast order book update: {}", e)
+                                        })
+                                        .ok();
                                 }
-                                Err(e) => warn!("Failed to parse ticker: {}", e),
+                                Err(e) => warn!(%channel, "Failed to parse ticker: {}", e),
                             }
                         }
                         _ => {
-                            warn!("Unhandled subscription channel: {}", channel);
+                            warn!(%channel, "Unhandled subscription channel");
                         }
                     }
                 }
@@ -172,14 +182,13 @@ impl DeribitClient {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn subscribe(self: &Arc<Self>, channel: &ChannelName) -> AppResult<()> {
-        let channel_name_string = channel.to_string();
-
-        let channel_name_string_clone = channel_name_string.clone();
+    async fn subscribe(self: &Arc<Self>, channel: &Channel) -> AppResult<()> {
         let previous_count = {
+            let channel_clone = channel.clone();
+
             let entry = self
                 .subscribed_channels
-                .entry(channel_name_string_clone)
+                .entry(channel_clone)
                 .or_insert(AtomicU32::new(0));
             entry.fetch_add(1, Ordering::Relaxed)
         };
@@ -196,7 +205,7 @@ impl DeribitClient {
             {
                 warn!(channel = %channel, "Failed to subscribe channel: {}", e);
                 self.subscribed_channels
-                    .get(&channel_name_string)
+                    .get(&channel)
                     .map(|c| c.fetch_sub(1, Ordering::Relaxed));
 
                 return Err(e);
@@ -206,17 +215,16 @@ impl DeribitClient {
         Ok(())
     }
 
-    pub async fn unsubscribe(self: &Arc<Self>, channel: ChannelName) -> AppResult<()> {
-        let channel_name_string = channel.to_string();
+    pub async fn unsubscribe(self: &Arc<Self>, channel: Channel) -> AppResult<()> {
         let should_unsubscribe = {
             self.subscribed_channels
-                .get(&channel_name_string)
+                .get(&channel)
                 .map(|c| c.fetch_sub(1, Ordering::Relaxed) == 1) // decrement count
                 .unwrap_or(false)
         };
 
         if should_unsubscribe {
-            self.subscribed_channels.remove(&channel_name_string);
+            self.subscribed_channels.remove(&channel);
 
             self.request::<serde_json::Value>(
                 "public/unsubscribe",
@@ -259,19 +267,20 @@ impl DeribitClient {
 
     pub async fn subscribe_ticker(
         self: &Arc<Self>,
-        channel: &ChannelName,
+        channel: &Channel,
         connection_id: Uuid,
     ) -> AppResult<SubscriptionStream<Ticker>> {
-        let instrument_name_filter = channel.instrument_name.clone();
-
+        let instrument_name_filter = channel.instrument().to_string();
         let filter = move |item: &Ticker| item.instrument_name == instrument_name_filter;
         self.subscribe(channel).await?;
 
         let stream = SubscriptionStream::new(
             self.tickers_tx.subscribe(),
             channel.clone(),
-            Arc::clone(self),
             connection_id,
+            OnDrop::Unsubscribe {
+                client: Arc::clone(self),
+            },
             filter,
         );
 
@@ -296,10 +305,10 @@ impl DeribitClient {
 
     pub async fn subscribe_order_book(
         self: &Arc<Self>,
-        channel: &ChannelName,
+        channel: &Channel,
         connection_id: Uuid,
     ) -> AppResult<SubscriptionStream<OrderBookUpdate>> {
-        let instrument_name_filter = channel.instrument_name.clone();
+        let instrument_name_filter = channel.instrument().to_string();
 
         let filter = move |item: &OrderBookUpdate| item.instrument_name == instrument_name_filter;
         self.subscribe(channel).await?;
@@ -307,8 +316,10 @@ impl DeribitClient {
         let stream = SubscriptionStream::new(
             self.book_change_tx.subscribe(),
             channel.clone(),
-            Arc::clone(self),
             connection_id,
+            OnDrop::Unsubscribe {
+                client: Arc::clone(self),
+            },
             filter,
         );
 

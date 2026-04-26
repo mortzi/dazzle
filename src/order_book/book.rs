@@ -19,10 +19,10 @@ impl Book {
         let mut bids = BTreeMap::new();
 
         for level in &snapshot.asks {
-            asks.insert(level.price as u64, level.amount as u64);
+            asks.insert(level.price as u64, level.size as u64);
         }
         for level in &snapshot.bids {
-            bids.insert(level.price as u64, level.amount as u64);
+            bids.insert(level.price as u64, level.size as u64);
         }
 
         Self {

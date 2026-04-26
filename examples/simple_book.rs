@@ -1,7 +1,7 @@
 use dazzle::app::bootstrap::create_app;
 use reqwest::Client;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, trace, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -31,9 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(res) => {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
-                info!(instrument, %status, "book response: {}", body);
+                info!(status = %status, "Response received");
+                trace!(instrument, %status, "book response: {}", body);
             }
-            Err(e) => info!(instrument, "request failed: {}", e),
+            Err(e) => warn!(instrument, "request failed: {}", e),
         }
     }
 
