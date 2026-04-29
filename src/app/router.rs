@@ -58,11 +58,12 @@ async fn stream_ticker(
     State(state): State<Arc<AppState>>,
     Path(instrument_name): Path<String>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, AppError>>>> {
-    info!(instrument_name, "Streaming ticker");
+    let connection_id = Uuid::new_v4();
+    info!(instrument_name, %connection_id, "Streaming ticker");
 
     let stream = state
         .deribit_client
-        .subscribe_ticker(&Channel::ticker(&instrument_name), Uuid::new_v4())
+        .subscribe_ticker(&Channel::ticker(&instrument_name), connection_id)
         .await?
         .map(|result| {
             result.and_then(|item| {
@@ -87,10 +88,13 @@ async fn start_book(
     if state.order_book_managers.contains_key(&channel) {
         return Ok(Json(()));
     }
+
     let book_manager =
         Arc::new(BookManager::new(Arc::clone(&state.deribit_client), channel.clone()).await?);
 
-    state.order_book_managers.insert(channel, book_manager);
+    state.order_book_managers
+        .entry(channel)
+        .or_insert(book_manager);
 
     Ok(Json(()))
 }

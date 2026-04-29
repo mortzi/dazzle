@@ -31,16 +31,20 @@ pub struct ConnectionManager {
     task: JoinHandle<()>,
     state_tx: watch::Sender<ConnectionState>,
 
-    pub state_rx: watch::Receiver<ConnectionState>,
     pub sender: mpsc::Sender<Utf8Bytes>,
-    pub receiver: mpsc::Receiver<Utf8Bytes>,
+    pub receiver: mpsc::Receiver<InboundMessage>,
+}
+
+pub enum InboundMessage {
+    Data(Utf8Bytes),
+    ConnectionLost,
 }
 
 struct ConnectionRunner {
     url: String,
     state_tx: watch::Sender<ConnectionState>,
-    inbound_tx: mpsc::Sender<Utf8Bytes>,    // WS → app
-    outbound_rx: mpsc::Receiver<Utf8Bytes>, // app → WS
+    inbound_tx: mpsc::Sender<InboundMessage>, // WS → app
+    outbound_rx: mpsc::Receiver<Utf8Bytes>,   // app → WS
 }
 
 enum DisconnectReason {
@@ -51,7 +55,7 @@ enum DisconnectReason {
 impl ConnectionManager {
     pub async fn connect(url: String) -> AppResult<Self> {
         let (outbound_tx, outbound_rx) = mpsc::channel::<Utf8Bytes>(32);
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Utf8Bytes>(32);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(32);
         let (state_tx, mut state_rx) = watch::channel(ConnectionState::Stopped);
 
         let runner = ConnectionRunner {
@@ -80,7 +84,6 @@ impl ConnectionManager {
         .map_err(|_| AppError::InternalError("Timed out waiting for connection".into()))??;
 
         Ok(Self {
-            state_rx,
             state_tx,
             sender: outbound_tx,
             receiver: inbound_rx,
@@ -90,7 +93,13 @@ impl ConnectionManager {
 
     pub async fn stop(self) {
         self.task.abort();
-        let _ = self.state_tx.send(ConnectionState::Stopped);
+        if let Err(e) = self.state_tx.send(ConnectionState::Stopped) {
+            error!("Failed to send ConnectionState {}", e);
+        }
+    }
+
+    pub fn subscribe_connection_state(&self) -> watch::Receiver<ConnectionState> {
+        self.state_tx.subscribe()
     }
 }
 
@@ -102,16 +111,19 @@ impl ConnectionRunner {
             .with_randomization_factor(0.3)
             .with_max_elapsed_time(None)
             .build();
+        let mut delay = None;
 
         loop {
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
             let _ = self.state_tx.send(ConnectionState::Connecting);
             debug!("WebSocket connecting to {}", &self.url);
 
             match connect_async(&self.url).await {
                 Err(e) => {
-                    let delay = backoff.next_backoff().unwrap_or(Duration::from_secs(30));
+                    delay = Some(backoff.next_backoff().unwrap_or(Duration::from_secs(30)));
                     error!("Connection failed: {}. Retrying in {:?}", e, delay);
-                    tokio::time::sleep(delay).await;
                 }
                 Ok((ws, _)) => {
                     let _ = self.state_tx.send(ConnectionState::Connected);
@@ -121,9 +133,8 @@ impl ConnectionRunner {
                     match self.handle_connection(ws).await {
                         DisconnectReason::ConnectionLost => {
                             let _ = self.state_tx.send(ConnectionState::Connecting);
-                            let delay = backoff.next_backoff().unwrap_or(Duration::from_secs(30));
+                            delay = Some(backoff.next_backoff().unwrap_or(Duration::from_secs(30)));
                             warn!("Connection lost. Reconnecting in {:?}", delay);
-                            tokio::time::sleep(delay).await;
                         }
                         DisconnectReason::Shutdown => {
                             let _ = self.state_tx.send(ConnectionState::Stopped);
@@ -132,6 +143,10 @@ impl ConnectionRunner {
                         }
                     }
                 }
+            }
+
+            if let Err(e) = self.inbound_tx.send(InboundMessage::ConnectionLost).await {
+                error!("Failed to send Inbound message ConnectionLost: {}", e);
             }
         }
     }
@@ -152,42 +167,47 @@ impl ConnectionRunner {
 
         loop {
             tokio::select! {
-                msg = stream.next() => {
-                    match msg {
-                        Some(some_msg) => match some_msg {
-                            Ok(ok_msg) => match ok_msg {
-                                Message::Text(text) => {
-                                    trace!(preview = &text[0..text.len()], "WS inbound");
-                                    if self.inbound_tx.send(text).await.is_err() {
-                                        // app dropped inbound_rx, no point continuing
-                                        return DisconnectReason::Shutdown;
+                result = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
+                    match result {
+                        Err(_elapsed) => {
+                            warn!("WS read timed out — no message in 30s");
+                            return DisconnectReason::ConnectionLost;
+                        }
+                        Ok(msg) => match msg {
+                            Some(some_msg) => match some_msg {
+                                Ok(ok_msg) => match ok_msg {
+                                    Message::Text(text) => {
+                                        trace!(preview = &text[0..text.len()], "WS inbound");
+                                        if self.inbound_tx.send(InboundMessage::Data(text)).await.is_err() {
+                                            return DisconnectReason::Shutdown;
+                                        }
                                     }
-                                }
-                                Message::Ping(data) => {
-                                    sink.send(Message::Pong(data))
-                                    .await
-                                    .unwrap_or_else(|e| error!("WS ping error: {}", e));
-                                }
-                                Message::Close(frame) => {
-                                    if let Some(f) = frame {
-                                        warn!("WS connection closed: {} (code: {})", f.reason, f.code);
-                                    } else {
-                                        warn!("WS connection closed without reason");
+                                    Message::Ping(data) => {
+                                        sink.send(Message::Pong(data))
+                                            .await
+                                            .unwrap_or_else(|e| error!("WS ping error: {}", e));
                                     }
+                                    Message::Close(frame) => {
+                                        if let Some(f) = frame {
+                                            warn!("WS connection closed: {} (code: {})", f.reason, f.code);
+                                        } else {
+                                            warn!("WS connection closed without reason");
+                                        }
+                                        return DisconnectReason::ConnectionLost;
+                                    }
+                                    _ => {
+                                        warn!("Unexpected WS message: {:?}", ok_msg);
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("WS read error: {}", e);
                                     return DisconnectReason::ConnectionLost;
                                 }
-                                _ => {
-                                    warn!("Unexpected WS message: {:?}", ok_msg);
-                                }
                             },
-                            Err(e) => {
-                                error!("WS read error: {}", e);
+                            None => {
+                                debug!("WS message of None received, closing the connection");
                                 return DisconnectReason::ConnectionLost;
                             }
-                        },
-                        None => {
-                            debug!("WS message of None received, closing the connection");
-                            return DisconnectReason::ConnectionLost;
                         }
                     }
                 }
@@ -203,7 +223,7 @@ impl ConnectionRunner {
                         None => {
                             debug!("Outbound channel receiver closed, closing the connection");
                             return DisconnectReason::Shutdown;
-                        },
+                        }
                     }
                 }
             }

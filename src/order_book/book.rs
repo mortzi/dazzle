@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use serde::{Deserialize, Serialize};
+
+use serde::{Serialize};
+
 use crate::deribit::models::OrderBookUpdate;
 
 // todo! fix the f64 to u64 conversion
@@ -14,6 +16,14 @@ pub struct Book {
 }
 
 impl Book {
+    pub fn new() -> Self {
+        Self {
+            asks: BTreeMap::new(),
+            bids: BTreeMap::new(),
+            change_id: 0,
+        }
+    }
+
     pub fn from_snapshot(snapshot: OrderBookUpdate) -> Self {
         let mut asks = BTreeMap::new();
         let mut bids = BTreeMap::new();

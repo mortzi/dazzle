@@ -21,8 +21,11 @@ use crate::{
     common::error::{AppError, AppResult},
     deribit::{
         channel::Channel,
-        connection::ConnectionManager,
-        models::{Instrument, OrderBook, OrderBookUpdate, Request, Response, Ticker},
+        connection::{ConnectionManager, InboundMessage},
+        models::{
+            Instrument, OrderBook, OrderBookUpdate, OrderBookUpdateMessage, Request, Response,
+            Ticker,
+        },
         subscription_stream::{OnDrop, SubscriptionStream},
     },
 };
@@ -33,26 +36,28 @@ pub struct DeribitClient {
     pending_requests: Arc<DashMap<u64, oneshot::Sender<Utf8Bytes>>>,
     subscribed_channels: DashMap<Channel, AtomicU32>,
     tickers_tx: broadcast::Sender<Ticker>,
-    book_change_tx: broadcast::Sender<OrderBookUpdate>,
+    book_change_tx: broadcast::Sender<OrderBookUpdateMessage>,
     _dispatch_loop_task: JoinHandle<()>,
 }
 
 impl DeribitClient {
     pub fn new(connection_manager: ConnectionManager) -> Self {
         let (tickers_tx, _) = broadcast::channel::<Ticker>(128);
-        let (book_change_tx, _) = broadcast::channel::<OrderBookUpdate>(128);
+        let (book_change_tx, _) = broadcast::channel::<OrderBookUpdateMessage>(128);
         let pending_requests = Arc::new(DashMap::new());
         let request_id = Arc::new(AtomicU64::new(1));
+        let receiver = connection_manager.receiver;
+        let sender = connection_manager.sender;
         let task = tokio::spawn(Self::dispatch_loop(
-            connection_manager.receiver,
-            connection_manager.sender.clone(),
+            receiver,
+            sender.clone(),
             Arc::clone(&request_id),
             Arc::clone(&pending_requests),
             tickers_tx.clone(),
             book_change_tx.clone(),
         ));
         Self {
-            sender: connection_manager.sender,
+            sender,
             request_id,
             tickers_tx,
             book_change_tx,
@@ -63,87 +68,105 @@ impl DeribitClient {
     }
 
     async fn dispatch_loop(
-        mut receiver: mpsc::Receiver<Utf8Bytes>,
+        mut receiver: mpsc::Receiver<InboundMessage>,
         sender: mpsc::Sender<Utf8Bytes>,
         request_id: Arc<AtomicU64>,
         pending_requests: Arc<DashMap<u64, oneshot::Sender<Utf8Bytes>>>,
         tickers_tx: broadcast::Sender<Ticker>,
-        book_change_tx: broadcast::Sender<OrderBookUpdate>,
+        book_change_tx: broadcast::Sender<OrderBookUpdateMessage>,
     ) {
-        while let Some(msg) = receiver.recv().await {
-            // Try to parse as a response with an id first
-            let Ok(raw) = serde_json::from_slice::<serde_json::Value>(msg.as_ref()) else {
-                warn!("Failed to parse WS message: {}", msg);
-                continue;
-            };
+        loop {
+            match receiver.recv().await {
+                Some(InboundMessage::Data(msg)) => {
+                    // Try to parse as a response with an id first
+                    let Ok(raw) = serde_json::from_slice::<serde_json::Value>(msg.as_ref()) else {
+                        warn!("Failed to parse WS message: {}", msg);
+                        continue;
+                    };
 
-            // It's a response to a pending request
-            if let Some(id) = raw.get("id").and_then(|v| v.as_u64()) {
-                if let Some((_, tx)) = pending_requests.remove(&id) {
-                    let _ = tx.send(msg);
-                }
-                continue;
-            }
+                    // It's a response to a pending request
+                    if let Some(id) = raw.get("id").and_then(|v| v.as_u64()) {
+                        if let Some((_, tx)) = pending_requests.remove(&id) {
+                            let _ = tx.send(msg);
+                        }
+                        continue;
+                    }
 
-            // It's a subscription push (no id)
-            let Some(method) = raw.get("method").and_then(|v| v.as_str()) else {
-                warn!("Unhandled WS message: {}", raw);
-                continue;
-            };
+                    // It's a subscription push (no id)
+                    let Some(method) = raw.get("method").and_then(|v| v.as_str()) else {
+                        warn!("Unhandled WS message: {}", raw);
+                        continue;
+                    };
 
-            match method {
-                "subscription" => {
-                    let channel = raw
-                        .pointer("/params/channel")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    match method {
+                        "subscription" => {
+                            let channel = raw
+                                .pointer("/params/channel")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
 
-                    let data_params = raw.pointer("/params/data").cloned().unwrap_or_default();
+                            let data_params =
+                                raw.pointer("/params/data").cloned().unwrap_or_default();
 
-                    match channel.split('.').next() {
-                        Some("ticker") => match serde_json::from_value::<Ticker>(data_params) {
-                            Ok(ticker) => {
-                                tickers_tx
-                                    .send(ticker)
-                                    .inspect_err(|e| {
-                                        warn!(%channel, "Failed to broadcast ticker update: {}", e)
-                                    })
-                                    .ok();
-                            }
-                            Err(e) => warn!(%channel, "Failed to parse ticker: {}", e),
-                        },
-                        Some("book") => {
-                            match serde_json::from_value::<OrderBookUpdate>(data_params) {
-                                Ok(book) => {
-                                    book_change_tx
-                                        .send(book)
-                                        .inspect_err(|e| {
-                                            warn!(%channel, "Failed to broadcast order book update: {}", e)
-                                        })
-                                        .ok();
+                            match channel.split('.').next() {
+                                Some("ticker") => {
+                                    match serde_json::from_value::<Ticker>(data_params) {
+                                        Ok(ticker) => {
+                                            tickers_tx
+                                            .send(ticker)
+                                            .inspect_err(|e| {
+                                                warn!(%channel, "Failed to broadcast ticker update: {}", e)
+                                            })
+                                            .ok();
+                                        }
+                                        Err(e) => warn!(%channel, "Failed to parse ticker: {}", e),
+                                    }
                                 }
-                                Err(e) => warn!(%channel, "Failed to parse ticker: {}", e),
+                                Some("book") => {
+                                    match serde_json::from_value::<OrderBookUpdate>(data_params) {
+                                        Ok(book) => {
+                                            book_change_tx
+                                                .send(OrderBookUpdateMessage::Data(book))
+                                                .inspect_err(|e| {
+                                                    warn!(%channel, "Failed to broadcast order book update: {}", e)
+                                                })
+                                                .ok();
+                                        }
+                                        Err(e) => warn!(%channel, "Failed to parse ticker: {}", e),
+                                    }
+                                }
+                                _ => {
+                                    warn!(%channel, "Unhandled subscription channel");
+                                }
                             }
                         }
-                        _ => {
-                            warn!(%channel, "Unhandled subscription channel");
-                        }
+                        "heartbeat" => match raw.pointer("/params/type").and_then(|v| v.as_str()) {
+                            Some("test_request") => {
+                                let id = request_id.fetch_add(1, Ordering::Relaxed);
+                                let pong = Request::new(id, "public/test", json!({}))
+                                    .to_utf8bytes()
+                                    .unwrap();
+                                if let Err(e) = sender.send(pong).await {
+                                    warn!("Failed to send heartbeat response: {}", e);
+                                }
+                            }
+                            Some("heartbeat") => debug!("Heartbeat received"),
+                            _ => {}
+                        },
+                        _ => warn!("Unhandled method: {}", method),
                     }
                 }
-                "heartbeat" => match raw.pointer("/params/type").and_then(|v| v.as_str()) {
-                    Some("test_request") => {
-                        let id = request_id.fetch_add(1, Ordering::Relaxed);
-                        let pong = Request::new(id, "public/test", json!({}))
-                            .to_utf8bytes()
-                            .unwrap();
-                        if let Err(e) = sender.send(pong).await {
-                            warn!("Failed to send heartbeat response: {}", e);
-                        }
+                Some(InboundMessage::ConnectionLost) => {
+                    if let Err(e) = book_change_tx.send(OrderBookUpdateMessage::ConnectionLost) {
+                        warn!(
+                            "Failed to broadcast ConnectionLost for order book update: {}",
+                            e
+                        );
                     }
-                    Some("heartbeat") => debug!("Heartbeat received"),
-                    _ => {}
-                },
-                _ => warn!("Unhandled method: {}", method),
+                }
+                None => {
+                    break;
+                }
             }
         }
 
@@ -289,9 +312,11 @@ impl DeribitClient {
 
     pub async fn get_book_snapshot(
         &self,
-        instrument_name: &str,
-        depth: u32,
+        channel: &Channel,
+        depth: Option<u32>,
     ) -> AppResult<OrderBook> {
+        let instrument_name = channel.instrument();
+        let depth = depth.unwrap_or(25);
         let order_book = self
             .request::<OrderBook>(
                 "public/get_order_book",
@@ -307,10 +332,13 @@ impl DeribitClient {
         self: &Arc<Self>,
         channel: &Channel,
         connection_id: Uuid,
-    ) -> AppResult<SubscriptionStream<OrderBookUpdate>> {
+    ) -> AppResult<SubscriptionStream<OrderBookUpdateMessage>> {
         let instrument_name_filter = channel.instrument().to_string();
 
-        let filter = move |item: &OrderBookUpdate| item.instrument_name == instrument_name_filter;
+        let filter = move |item: &OrderBookUpdateMessage| match item {
+            OrderBookUpdateMessage::Data(data) => data.instrument_name == instrument_name_filter,
+            OrderBookUpdateMessage::ConnectionLost => false,
+        };
         self.subscribe(channel).await?;
 
         let stream = SubscriptionStream::new(

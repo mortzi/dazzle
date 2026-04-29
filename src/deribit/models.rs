@@ -128,7 +128,6 @@ pub struct OrderBook {
     pub funding_8h: f64,
 }
 
-// ! not yet checked !
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum BookUpdateType {
@@ -141,6 +140,12 @@ pub struct BookLevel {
     pub action: String, // "new", "change", "delete"
     pub price: f64,
     pub size: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum OrderBookUpdateMessage {
+    Data(OrderBookUpdate),
+    ConnectionLost,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
