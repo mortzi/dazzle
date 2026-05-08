@@ -231,3 +231,43 @@ fn apply_level(levels: &mut BTreeMap<Price, Quantity>, level: &BookLevel) {
         _ => warn!("Unknown order book action: {}", level.action),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deribit::models::BookLevel;
+
+    fn level(action: &str, price: f64, size: f64) -> BookLevel {
+        BookLevel { action: action.into(), price, size }
+    }
+
+    #[test]
+    fn apply_level_new() {
+        let mut levels = BTreeMap::new();
+        apply_level(&mut levels, &level("new", 100.0, 5.0));
+        assert_eq!(levels.get(&Price::from_f64(100.0)), Some(&Quantity::from_f64(5.0)));
+    }
+
+    #[test]
+    fn apply_level_change_updates_qty() {
+        let mut levels = BTreeMap::new();
+        apply_level(&mut levels, &level("new", 100.0, 5.0));
+        apply_level(&mut levels, &level("change", 100.0, 3.0));
+        assert_eq!(levels.get(&Price::from_f64(100.0)), Some(&Quantity::from_f64(3.0)));
+    }
+
+    #[test]
+    fn apply_level_delete_removes_level() {
+        let mut levels = BTreeMap::new();
+        apply_level(&mut levels, &level("new", 100.0, 5.0));
+        apply_level(&mut levels, &level("delete", 100.0, 0.0));
+        assert!(levels.get(&Price::from_f64(100.0)).is_none());
+    }
+
+    #[test]
+    fn apply_level_delete_nonexistent_is_noop() {
+        let mut levels = BTreeMap::new();
+        apply_level(&mut levels, &level("delete", 100.0, 0.0));
+        assert!(levels.is_empty());
+    }
+}

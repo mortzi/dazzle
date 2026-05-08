@@ -183,6 +183,7 @@ impl Book {
     }
 }
 
+
 /// Serializes the book as the standard order book format:
 /// { asks: [[price, qty], ...], bids: [[price, qty], ...], change_id: N }
 /// Asks are ascending (lowest ask first); bids are descending (highest bid first).
@@ -208,3 +209,128 @@ impl Serialize for Book {
         state.end()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deribit::models::{BookLevel, BookUpdateType, OrderBookUpdate};
+
+    fn make_book() -> Book {
+        let mut book = Book::new();
+        book.bids.insert(Price::from_f64(100.0), Quantity::from_f64(1.0));
+        book.bids.insert(Price::from_f64(99.0), Quantity::from_f64(2.0));
+        book.bids.insert(Price::from_f64(98.0), Quantity::from_f64(3.0));
+        book.asks.insert(Price::from_f64(101.0), Quantity::from_f64(1.5));
+        book.asks.insert(Price::from_f64(102.0), Quantity::from_f64(2.5));
+        book.asks.insert(Price::from_f64(103.0), Quantity::from_f64(3.5));
+        book
+    }
+
+    fn snapshot(asks: Vec<(f64, f64)>, bids: Vec<(f64, f64)>) -> OrderBookUpdate {
+        OrderBookUpdate {
+            instrument_name: "BTC-PERPETUAL".into(),
+            timestamp: 0,
+            change_id: 42,
+            prev_change_id: None,
+            update_type: BookUpdateType::Snapshot,
+            asks: asks.into_iter().map(|(p, s)| BookLevel { action: "new".into(), price: p, size: s }).collect(),
+            bids: bids.into_iter().map(|(p, s)| BookLevel { action: "new".into(), price: p, size: s }).collect(),
+        }
+    }
+
+    #[test]
+    fn price_roundtrip() {
+        assert_eq!(Price::from_f64(80258.5).to_f64(), 80258.5);
+        assert_eq!(Price::from_f64(0.0023).to_f64(), 0.0023);
+    }
+
+    #[test]
+    fn price_distinct_fractional() {
+        // fixed-point must distinguish these — old truncation bug would make them equal
+        assert_ne!(Price::from_f64(80258.0), Price::from_f64(80258.5));
+    }
+
+    #[test]
+    fn price_ordering() {
+        assert!(Price::from_f64(100.0) < Price::from_f64(100.5));
+    }
+
+    #[test]
+    fn from_snapshot_populates_book() {
+        let book = Book::from_snapshot(&snapshot(vec![(101.0, 5.0)], vec![(99.0, 3.0)]));
+        assert_eq!(book.change_id, 42);
+        assert_eq!(book.best_ask(), Some(Price::from_f64(101.0)));
+        assert_eq!(book.best_bid(), Some(Price::from_f64(99.0)));
+    }
+
+    #[test]
+    fn analytics_empty_book() {
+        let book = Book::new();
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.spread(), None);
+        assert_eq!(book.mid_price(), None);
+    }
+
+    #[test]
+    fn best_bid_ask() {
+        let book = make_book();
+        assert_eq!(book.best_bid(), Some(Price::from_f64(100.0)));
+        assert_eq!(book.best_ask(), Some(Price::from_f64(101.0)));
+    }
+
+    #[test]
+    fn spread() {
+        let book = make_book();
+        assert_eq!(book.spread(), Some(Price::from_f64(1.0)));
+    }
+
+    #[test]
+    fn mid_price() {
+        let book = make_book();
+        assert_eq!(book.mid_price(), Some(Price::from_f64(100.5)));
+    }
+
+    #[test]
+    fn walk_book_buy_single_level() {
+        let book = make_book();
+        let r = book.walk_book(Side::Buy, Quantity::from_f64(1.5)).unwrap();
+        assert_eq!(r.avg_price, Price::from_f64(101.0));
+        assert_eq!(r.filled, Quantity::from_f64(1.5));
+        assert_eq!(r.unfilled, Quantity::from_f64(0.0));
+    }
+
+    #[test]
+    fn walk_book_buy_multi_level_slippage() {
+        let book = make_book();
+        // 1.5@101 + 2.5@102 = 406.5 notional / 4.0 qty = 101.625 avg
+        let r = book.walk_book(Side::Buy, Quantity::from_f64(4.0)).unwrap();
+        assert_eq!(r.avg_price, Price::from_f64(101.625));
+        assert_eq!(r.filled, Quantity::from_f64(4.0));
+        assert_eq!(r.unfilled, Quantity::from_f64(0.0));
+    }
+
+    #[test]
+    fn walk_book_buy_exceeds_depth() {
+        let book = make_book();
+        // total ask depth = 1.5 + 2.5 + 3.5 = 7.5
+        let r = book.walk_book(Side::Buy, Quantity::from_f64(100.0)).unwrap();
+        assert_eq!(r.filled, Quantity::from_f64(7.5));
+        assert_eq!(r.unfilled, Quantity::from_f64(92.5));
+    }
+
+    #[test]
+    fn walk_book_sell_single_level() {
+        let book = make_book();
+        let r = book.walk_book(Side::Sell, Quantity::from_f64(1.0)).unwrap();
+        assert_eq!(r.avg_price, Price::from_f64(100.0));
+        assert_eq!(r.filled, Quantity::from_f64(1.0));
+        assert_eq!(r.unfilled, Quantity::from_f64(0.0));
+    }
+
+    #[test]
+    fn walk_book_empty_returns_none() {
+        assert!(Book::new().walk_book(Side::Buy, Quantity::from_f64(1.0)).is_none());
+    }
+}
+
