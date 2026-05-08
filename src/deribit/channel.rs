@@ -103,3 +103,55 @@ impl Serialize for Channel {
         serializer.serialize_str(&self.full)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_splits_correctly() {
+        let ch = Channel::new("BTC-PERPETUAL", "book", "100ms");
+        assert_eq!(ch.kind(), "book");
+        assert_eq!(ch.instrument(), "BTC-PERPETUAL");
+        assert_eq!(ch.interval(), "100ms");
+        assert_eq!(ch.as_str(), "book.BTC-PERPETUAL.100ms");
+    }
+
+    #[test]
+    fn ticker_factory() {
+        let ch = Channel::ticker("ETH-PERPETUAL");
+        assert_eq!(ch.kind(), "ticker");
+        assert_eq!(ch.instrument(), "ETH-PERPETUAL");
+        assert_eq!(ch.interval(), "100ms");
+    }
+
+    #[test]
+    fn parse_valid() {
+        let ch = Channel::parse("book.BTC-PERPETUAL.100ms").unwrap();
+        assert_eq!(ch.kind(), "book");
+        assert_eq!(ch.instrument(), "BTC-PERPETUAL");
+        assert_eq!(ch.interval(), "100ms");
+    }
+
+    #[test]
+    fn parse_missing_interval_errors() {
+        assert!(Channel::parse("book.BTC-PERPETUAL").is_err());
+    }
+
+    #[test]
+    fn parse_missing_instrument_errors() {
+        assert!(Channel::parse("book").is_err());
+    }
+
+    #[test]
+    fn equality_based_on_full_string() {
+        let a = Channel::new("BTC-PERPETUAL", "book", "100ms");
+        let b = Channel::parse("book.BTC-PERPETUAL.100ms").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn display() {
+        assert_eq!(Channel::book("BTC-PERPETUAL").to_string(), "book.BTC-PERPETUAL.100ms");
+    }
+}
