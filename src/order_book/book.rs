@@ -93,7 +93,7 @@ impl Book {
         Self::default()
     }
 
-    pub fn from_snapshot(snapshot: OrderBookUpdate) -> Self {
+    pub fn from_snapshot(snapshot: &OrderBookUpdate) -> Self {
         let asks = snapshot
             .asks
             .iter()
@@ -111,6 +111,75 @@ impl Book {
             bids,
             change_id: snapshot.change_id,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WalkResult {
+    pub avg_price: Price,
+    pub filled: Quantity,
+    pub unfilled: Quantity,
+}
+
+impl Book {
+    pub fn best_bid(&self) -> Option<Price> {
+        self.bids.keys().next_back().copied()
+    }
+
+    pub fn best_ask(&self) -> Option<Price> {
+        self.asks.keys().next().copied()
+    }
+
+    pub fn spread(&self) -> Option<Price> {
+        let ask = self.best_ask()?;
+        let bid = self.best_bid()?;
+        Some(Price(ask.0.saturating_sub(bid.0)))
+    }
+
+    pub fn mid_price(&self) -> Option<Price> {
+        let ask = self.best_ask()?;
+        let bid = self.best_bid()?;
+        Some(Price(((ask.0 as u128 + bid.0 as u128) / 2) as u64))
+    }
+
+    /// Simulates filling a market order of `quantity` on the given `side`.
+    /// Walks price levels in aggressive order (asks ascending for Buy, bids descending for Sell).
+    /// Returns None if the book on that side is empty.
+    pub fn walk_book(&self, side: Side, quantity: Quantity) -> Option<WalkResult> {
+        let mut remaining = quantity.raw();
+        let mut notional: u128 = 0;
+        let mut filled: u64 = 0;
+
+        let levels: Box<dyn Iterator<Item = (&Price, &Quantity)>> = match side {
+            Side::Buy => Box::new(self.asks.iter()),
+            Side::Sell => Box::new(self.bids.iter().rev()),
+        };
+
+        for (price, qty) in levels {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(qty.raw());
+            notional += price.raw() as u128 * take as u128;
+            filled += take;
+            remaining -= take;
+        }
+
+        if filled == 0 {
+            return None;
+        }
+
+        Some(WalkResult {
+            avg_price: Price((notional / filled as u128) as u64),
+            filled: Quantity(filled),
+            unfilled: Quantity(remaining),
+        })
     }
 }
 

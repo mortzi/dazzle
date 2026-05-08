@@ -30,7 +30,6 @@ pub struct BookManager {
     book_tx: broadcast::Sender<Book>,
     book: Arc<RwLock<Book>>,
     snapshot_rx: watch::Receiver<bool>,
-    client: Arc<DeribitClient>,
     task: JoinHandle<()>,
 }
 
@@ -51,7 +50,6 @@ impl BookManager {
             book_tx,
             book,
             snapshot_rx,
-            client,
             task,
         })
     }
@@ -163,7 +161,7 @@ impl BookManager {
                             BookUpdateType::Snapshot => {
                                 {
                                     let mut book = book.write().await;
-                                    *book = Book::from_snapshot(update);
+                                    *book = Book::from_snapshot(&update);
                                 }
                                 let _ = snapshot_tx.send(true);
                                 backoff.reset();

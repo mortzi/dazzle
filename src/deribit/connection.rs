@@ -12,7 +12,7 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, Utf8Bytes},
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     common::error::{AppError, AppResult},
@@ -92,10 +92,8 @@ impl ConnectionManager {
     }
 
     pub async fn stop(self) {
-        self.task.abort();
-        if let Err(e) = self.state_tx.send(ConnectionState::Stopped) {
-            error!("Failed to send ConnectionState {}", e);
-        }
+        drop(self.sender);
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
     }
 
     pub fn subscribe_connection_state(&self) -> watch::Receiver<ConnectionState> {
@@ -114,14 +112,15 @@ impl ConnectionRunner {
         let mut delay = None;
 
         loop {
+            let _ = self.state_tx.send(ConnectionState::Connecting);
             if let Some(d) = delay {
                 tokio::time::sleep(d).await;
             }
-            let _ = self.state_tx.send(ConnectionState::Connecting);
             debug!("WebSocket connecting to {}", &self.url);
 
             match connect_async(&self.url).await {
                 Err(e) => {
+                    let _ = self.state_tx.send(ConnectionState::Failed);
                     delay = Some(backoff.next_backoff().unwrap_or(Duration::from_secs(30)));
                     error!("Connection failed: {}. Retrying in {:?}", e, delay);
                 }
@@ -132,7 +131,7 @@ impl ConnectionRunner {
 
                     match self.handle_connection(ws).await {
                         DisconnectReason::ConnectionLost => {
-                            let _ = self.state_tx.send(ConnectionState::Connecting);
+                            let _ = self.state_tx.send(ConnectionState::Failed);
                             delay = Some(backoff.next_backoff().unwrap_or(Duration::from_secs(30)));
                             warn!("Connection lost. Reconnecting in {:?}", delay);
                         }
@@ -159,7 +158,7 @@ impl ConnectionRunner {
 
         let heartbeat_msg = Request::new(0, "public/set_heartbeat", json!({ "interval": 30 }))
             .to_utf8bytes()
-            .unwrap();
+            .expect("static heartbeat JSON is always valid");
 
         if sink.send(Message::Text(heartbeat_msg)).await.is_err() {
             return DisconnectReason::ConnectionLost;
@@ -167,17 +166,17 @@ impl ConnectionRunner {
 
         loop {
             tokio::select! {
-                result = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
+                result = tokio::time::timeout(Duration::from_secs(45), stream.next()) => {
                     match result {
                         Err(_elapsed) => {
-                            warn!("WS read timed out — no message in 30s");
+                            warn!("WS read timed out — no message in 45s");
                             return DisconnectReason::ConnectionLost;
                         }
                         Ok(msg) => match msg {
                             Some(some_msg) => match some_msg {
                                 Ok(ok_msg) => match ok_msg {
                                     Message::Text(text) => {
-                                        trace!(preview = &text[0..text.len()], "WS inbound");
+                                        // trace!(preview = &*text, "WS inbound");
                                         if self.inbound_tx.send(InboundMessage::Data(text)).await.is_err() {
                                             return DisconnectReason::Shutdown;
                                         }
@@ -214,7 +213,7 @@ impl ConnectionRunner {
                 msg = self.outbound_rx.recv() => {
                     match msg {
                         Some(text) => {
-                            trace!(preview = &text[0..text.len()], "WS outbound");
+                            // trace!(preview = &*text, "WS outbound");
                             if let Err(e) = sink.send(Message::Text(text)).await {
                                 error!("WS write error: {}", e);
                                 return DisconnectReason::ConnectionLost;

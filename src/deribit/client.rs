@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{Mutex, broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_tungstenite::tungstenite::Utf8Bytes;
@@ -22,10 +22,7 @@ use crate::{
     deribit::{
         channel::Channel,
         connection::{ConnectionManager, InboundMessage},
-        models::{
-            Instrument, OrderBook, OrderBookUpdate, OrderBookUpdateMessage, Request, Response,
-            Ticker,
-        },
+        models::{Instrument, OrderBookUpdate, OrderBookUpdateMessage, Request, Response, Ticker},
         subscription_stream::{OnDrop, SubscriptionStream},
     },
 };
@@ -34,7 +31,7 @@ pub struct DeribitClient {
     sender: mpsc::Sender<Utf8Bytes>,
     request_id: Arc<AtomicU64>,
     pending_requests: Arc<DashMap<u64, oneshot::Sender<Utf8Bytes>>>,
-    subscribed_channels: DashMap<Channel, AtomicU32>,
+    subscribed_channels: DashMap<Channel, Arc<Mutex<u32>>>,
     tickers_tx: broadcast::Sender<Ticker>,
     book_change_tx: broadcast::Sender<OrderBookUpdateMessage>,
     _dispatch_loop_task: JoinHandle<()>,
@@ -132,7 +129,9 @@ impl DeribitClient {
                                                 })
                                                 .ok();
                                         }
-                                        Err(e) => warn!(%channel, "Failed to parse ticker: {}", e),
+                                        Err(e) => {
+                                            warn!(%channel, "Failed to parse order book update: {}", e)
+                                        }
                                     }
                                 }
                                 _ => {
@@ -145,7 +144,7 @@ impl DeribitClient {
                                 let id = request_id.fetch_add(1, Ordering::Relaxed);
                                 let pong = Request::new(id, "public/test", json!({}))
                                     .to_utf8bytes()
-                                    .unwrap();
+                                    .expect("static pong JSON is always valid");
                                 if let Err(e) = sender.send(pong).await {
                                     warn!("Failed to send heartbeat response: {}", e);
                                 }
@@ -206,58 +205,45 @@ impl DeribitClient {
     }
 
     async fn subscribe(self: &Arc<Self>, channel: &Channel) -> AppResult<()> {
-        let previous_count = {
-            let channel_clone = channel.clone();
+        let entry = self
+            .subscribed_channels
+            .entry(channel.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(0)))
+            .clone();
 
-            let entry = self
-                .subscribed_channels
-                .entry(channel_clone)
-                .or_insert(AtomicU32::new(0));
-            entry.fetch_add(1, Ordering::Relaxed)
-        };
-
-        if previous_count == 0 {
+        let mut count = entry.lock().await;
+        if *count == 0 {
             if let Err(e) = self
-                .request::<serde_json::Value>(
-                    "public/subscribe",
-                    json!({
-                        "channels": [channel],
-                    }),
-                )
+                .request::<serde_json::Value>("public/subscribe", json!({ "channels": [channel] }))
                 .await
             {
                 warn!(channel = %channel, "Failed to subscribe channel: {}", e);
-                self.subscribed_channels
-                    .get(&channel)
-                    .map(|c| c.fetch_sub(1, Ordering::Relaxed));
-
                 return Err(e);
             }
         }
-
+        *count += 1;
         Ok(())
     }
 
     pub async fn unsubscribe(self: &Arc<Self>, channel: Channel) -> AppResult<()> {
-        let should_unsubscribe = {
-            self.subscribed_channels
-                .get(&channel)
-                .map(|c| c.fetch_sub(1, Ordering::Relaxed) == 1) // decrement count
-                .unwrap_or(false)
+        let entry = match self.subscribed_channels.get(&channel) {
+            Some(e) => Arc::clone(&*e),
+            None => return Ok(()),
         };
 
-        if should_unsubscribe {
+        let mut count = entry.lock().await;
+        if *count <= 1 {
+            *count = 0;
             self.subscribed_channels.remove(&channel);
-
+            drop(count); // release lock before network call
             self.request::<serde_json::Value>(
                 "public/unsubscribe",
-                json!({
-                    "channels": [channel],
-                }),
+                json!({ "channels": [channel] }),
             )
             .await?;
+        } else {
+            *count -= 1;
         }
-
         Ok(())
     }
 
@@ -308,24 +294,6 @@ impl DeribitClient {
         );
 
         Ok(stream)
-    }
-
-    pub async fn get_book_snapshot(
-        &self,
-        channel: &Channel,
-        depth: Option<u32>,
-    ) -> AppResult<OrderBook> {
-        let instrument_name = channel.instrument();
-        let depth = depth.unwrap_or(25);
-        let order_book = self
-            .request::<OrderBook>(
-                "public/get_order_book",
-                json!({"instrument_name": instrument_name, "depth": depth}),
-            )
-            .await?
-            .result;
-
-        Ok(order_book)
     }
 
     pub async fn subscribe_order_book(

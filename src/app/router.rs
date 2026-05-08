@@ -17,13 +17,13 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    app::{app_state::AppState, models::BookQuery},
+    app::app_state::AppState,
     common::error::{AppError, AppResult},
     deribit::{
         channel::Channel,
         models::{Instrument, Ticker},
     },
-    order_book::{book::Book, book_manager::BookManager},
+    order_book::book::Book,
 };
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -85,17 +85,7 @@ async fn start_book(
 ) -> AppResult<Json<()>> {
     let channel = Channel::book(&instrument_name);
     info!(%channel, "Starting order book");
-    if state.order_book_managers.contains_key(&channel) {
-        return Ok(Json(()));
-    }
-
-    let book_manager =
-        Arc::new(BookManager::new(Arc::clone(&state.deribit_client), channel.clone()).await?);
-
-    state.order_book_managers
-        .entry(channel)
-        .or_insert(book_manager);
-
+    state.get_or_create_book_manager(channel).await?;
     Ok(Json(()))
 }
 
@@ -105,7 +95,7 @@ async fn stop_book(
 ) -> AppResult<Json<()>> {
     let channel = Channel::book(&instrument_name);
     info!(%channel, "Stopping order book");
-    if let Some(_) = state.order_book_managers.remove(&channel) {
+    if state.remove_book_manager(&channel) {
         info!(%channel, "Order book stopped");
     }
     Ok(Json(()))
@@ -118,19 +108,7 @@ async fn get_book(
     let channel = Channel::book(&instrument_name);
     info!(%channel, "Fetching order book");
 
-    let manager = match state.order_book_managers.get(&channel) {
-        Some(m) => Arc::clone(&*m),
-        None => {
-            let manager = Arc::new(
-                BookManager::new(Arc::clone(&state.deribit_client), channel.clone()).await?,
-            );
-            state
-                .order_book_managers
-                .insert(channel, Arc::clone(&manager));
-            manager
-        }
-    };
-
+    let manager = state.get_or_create_book_manager(channel).await?;
     manager
         .wait_for_snapshot(std::time::Duration::from_secs(10))
         .await?;
@@ -146,18 +124,7 @@ async fn stream_book(
     let connection_id = Uuid::new_v4();
     info!(%channel, %connection_id, "Streaming order book");
 
-    let book_manager = match state.order_book_managers.get(&channel) {
-        Some(manager) => Arc::clone(&*manager),
-        None => {
-            let manager = Arc::new(
-                BookManager::new(Arc::clone(&state.deribit_client), channel.clone()).await?,
-            );
-            state
-                .order_book_managers
-                .insert(channel, Arc::clone(&manager));
-            manager
-        }
-    };
+    let book_manager = state.get_or_create_book_manager(channel).await?;
 
     let stream = book_manager
         .subscribe_book(connection_id)?

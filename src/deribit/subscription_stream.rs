@@ -50,7 +50,7 @@ where
                 Ok(_) => None,
                 Err(BroadcastStreamRecvError::Lagged(n)) => {
                     warn!("Stream lagged, dropped {} messages", n);
-                    None // skip, keep stream alive
+                    Some(Err(AppError::InternalError(format!("Stream lagged, dropped {} messages", n))))
                 }
             }
         });

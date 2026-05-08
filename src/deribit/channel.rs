@@ -10,8 +10,8 @@ use crate::common::error::{AppError, AppResult};
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub full: String,          // "book.BTC-PERPETUAL.100ms"
-    pub kind_end: usize,       // index of first '.'
-    pub instrument_end: usize, // index of second '.'
+    kind_end: usize,       // index of first '.'
+    instrument_end: usize, // index of second '.'
 }
 
 impl Channel {
