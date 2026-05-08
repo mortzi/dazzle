@@ -3,21 +3,21 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use backoff::{ExponentialBackoffBuilder, SystemClock, backoff::Backoff};
 use futures_util::StreamExt;
 use tokio::{
-    sync::{RwLock, broadcast},
+    sync::{RwLock, broadcast, watch},
     task::JoinHandle,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    common::error::AppResult,
+    common::error::{AppError, AppResult},
     deribit::{
         channel::Channel,
         client::DeribitClient,
         models::{BookLevel, BookUpdateType, OrderBookUpdateMessage},
         subscription_stream::{OnDrop, SubscriptionStream},
     },
-    order_book::book::{Book, LevelAmount, PriceLevel},
+    order_book::book::{Book, Price, Quantity},
 };
 
 enum BookStreamReason {
@@ -29,6 +29,7 @@ pub struct BookManager {
     channel: Channel,
     book_tx: broadcast::Sender<Book>,
     book: Arc<RwLock<Book>>,
+    snapshot_rx: watch::Receiver<bool>,
     client: Arc<DeribitClient>,
     task: JoinHandle<()>,
 }
@@ -37,19 +38,53 @@ impl BookManager {
     pub async fn new(client: Arc<DeribitClient>, channel: Channel) -> AppResult<Self> {
         let book = Arc::new(RwLock::new(Book::new()));
         let (book_tx, _) = broadcast::channel(128);
+        let (snapshot_tx, snapshot_rx) = watch::channel(false);
         let task = tokio::spawn(Self::maintain_book_state(
             Arc::clone(&client),
             channel.clone(),
             Arc::clone(&book),
             book_tx.clone(),
+            snapshot_tx,
         ));
         Ok(Self {
             channel,
             book_tx,
             book,
+            snapshot_rx,
             client,
             task,
         })
+    }
+
+    pub async fn wait_for_snapshot(&self, timeout: Duration) -> AppResult<()> {
+        let mut rx = self.snapshot_rx.clone();
+        if *rx.borrow() {
+            return Ok(());
+        }
+        tokio::time::timeout(timeout, rx.wait_for(|ready| *ready))
+            .await
+            .map_err(|_| {
+                AppError::InternalError("Timed out waiting for order book snapshot".into())
+            })?
+            .map_err(|_| AppError::InternalError("Snapshot watch channel closed".into()))?;
+        Ok(())
+    }
+
+    pub async fn get_book(&self) -> Book {
+        self.book.read().await.clone()
+    }
+
+    pub fn subscribe_book(
+        self: &Arc<Self>,
+        connection_id: Uuid,
+    ) -> AppResult<SubscriptionStream<Book>> {
+        Ok(SubscriptionStream::new(
+            self.book_tx.subscribe(),
+            self.channel.clone(),
+            connection_id,
+            OnDrop::KeepAlive,
+            |_| true,
+        ))
     }
 
     async fn maintain_book_state(
@@ -57,6 +92,7 @@ impl BookManager {
         channel: Channel,
         book: Arc<RwLock<Book>>,
         book_tx: broadcast::Sender<Book>,
+        snapshot_tx: watch::Sender<bool>,
     ) {
         let mut backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_millis(500))
@@ -80,8 +116,15 @@ impl BookManager {
                 }
             };
 
-            match Self::handle_book_stream(&channel, &book, &book_tx, &mut backoff, &mut stream)
-                .await
+            match Self::handle_book_stream(
+                &channel,
+                &book,
+                &book_tx,
+                &snapshot_tx,
+                &mut backoff,
+                &mut stream,
+            )
+            .await
             {
                 BookStreamReason::StreamEnded => {
                     delay = Some(backoff.next_backoff().unwrap_or(Duration::from_secs(10)));
@@ -100,6 +143,7 @@ impl BookManager {
         channel: &Channel,
         book: &Arc<RwLock<Book>>,
         book_tx: &broadcast::Sender<Book>,
+        snapshot_tx: &watch::Sender<bool>,
         backoff: &mut backoff::exponential::ExponentialBackoff<SystemClock>,
         stream: &mut SubscriptionStream<OrderBookUpdateMessage>,
     ) -> BookStreamReason {
@@ -121,6 +165,7 @@ impl BookManager {
                                     let mut book = book.write().await;
                                     *book = Book::from_snapshot(update);
                                 }
+                                let _ = snapshot_tx.send(true);
                                 backoff.reset();
                                 info!(%channel, "Order book snapshot received, streaming updates");
                             }
@@ -168,23 +213,6 @@ impl BookManager {
             }
         }
     }
-
-    pub async fn get_book(&self) -> Book {
-        self.book.read().await.clone()
-    }
-
-    pub fn subscribe_book(
-        self: &Arc<Self>,
-        connection_id: Uuid,
-    ) -> AppResult<SubscriptionStream<Book>> {
-        Ok(SubscriptionStream::new(
-            self.book_tx.subscribe(),
-            self.channel.clone(),
-            connection_id,
-            OnDrop::KeepAlive,
-            |_| true,
-        ))
-    }
 }
 
 impl Drop for BookManager {
@@ -193,11 +221,11 @@ impl Drop for BookManager {
     }
 }
 
-fn apply_level(levels: &mut BTreeMap<PriceLevel, LevelAmount>, level: &BookLevel) {
-    let price = level.price as u64;
+fn apply_level(levels: &mut BTreeMap<Price, Quantity>, level: &BookLevel) {
+    let price = Price::from_f64(level.price);
     match level.action.as_str() {
         "new" | "change" => {
-            levels.insert(price, level.size as u64);
+            levels.insert(price, Quantity::from_f64(level.size));
         }
         "delete" => {
             levels.remove(&price);

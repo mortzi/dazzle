@@ -13,7 +13,7 @@ use axum::{
 use futures::Stream;
 use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -114,17 +114,28 @@ async fn stop_book(
 async fn get_book(
     State(state): State<Arc<AppState>>,
     Path(instrument_name): Path<String>,
-    Query(query): Query<BookQuery>,
 ) -> AppResult<Json<Book>> {
     let channel = Channel::book(&instrument_name);
     info!(%channel, "Fetching order book");
 
-    let manager = BookManager::new(Arc::clone(&state.deribit_client), channel).await?;
-    let book = manager.get_book().await;
-    debug!("Waiting 5 sec to update order book");
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    debug!("Returning order book");
-    Ok(Json(book))
+    let manager = match state.order_book_managers.get(&channel) {
+        Some(m) => Arc::clone(&*m),
+        None => {
+            let manager = Arc::new(
+                BookManager::new(Arc::clone(&state.deribit_client), channel.clone()).await?,
+            );
+            state
+                .order_book_managers
+                .insert(channel, Arc::clone(&manager));
+            manager
+        }
+    };
+
+    manager
+        .wait_for_snapshot(std::time::Duration::from_secs(10))
+        .await?;
+
+    Ok(Json(manager.get_book().await))
 }
 
 async fn stream_book(
