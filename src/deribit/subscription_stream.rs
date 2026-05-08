@@ -92,3 +92,63 @@ impl<T> Drop for SubscriptionStream<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast;
+    use tokio_stream::StreamExt;
+
+    use crate::deribit::channel::Channel;
+
+    fn make_stream(
+        rx: broadcast::Receiver<i32>,
+        filter: impl Fn(&i32) -> bool + Send + Sync + 'static,
+    ) -> SubscriptionStream<i32> {
+        SubscriptionStream::new(
+            rx,
+            Channel::ticker("TEST"),
+            Uuid::new_v4(),
+            OnDrop::KeepAlive,
+            filter,
+        )
+    }
+
+    #[tokio::test]
+    async fn filter_passes_matching_items() {
+        let (tx, rx) = broadcast::channel::<i32>(16);
+        let mut stream = make_stream(rx, |v| *v % 2 == 0);
+
+        tx.send(1).unwrap(); // filtered out
+        tx.send(2).unwrap(); // passes
+        tx.send(3).unwrap(); // filtered out
+        tx.send(4).unwrap(); // passes
+        drop(tx);
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), 2);
+        assert_eq!(stream.next().await.unwrap().unwrap(), 4);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_ends_when_sender_dropped() {
+        let (tx, rx) = broadcast::channel::<i32>(16);
+        let mut stream = make_stream(rx, |_| true);
+        drop(tx);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lag_returns_error() {
+        let (tx, rx) = broadcast::channel::<i32>(2); // capacity 2
+        let mut stream = make_stream(rx, |_| true);
+
+        // overflow the buffer — receiver misses oldest message
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+
+        let first = stream.next().await.unwrap();
+        assert!(first.is_err());
+    }
+}
