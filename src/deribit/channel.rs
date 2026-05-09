@@ -1,6 +1,7 @@
 use std::{
     fmt::Display,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use serde::{Serialize, Serializer};
@@ -9,14 +10,14 @@ use crate::common::error::{AppError, AppResult};
 
 #[derive(Debug, Clone)]
 pub struct Channel {
-    pub full: String,          // "book.BTC-PERPETUAL.100ms"
+    pub full: Arc<str>,    // "book.BTC-PERPETUAL.100ms"
     kind_end: usize,       // index of first '.'
     instrument_end: usize, // index of second '.'
 }
 
 impl Channel {
     pub fn new(instrument: &str, kind: &str, interval: &str) -> Self {
-        let full = format!("{}.{}.{}", kind, instrument, interval);
+        let full: Arc<str> = format!("{}.{}.{}", kind, instrument, interval).into();
         let kind_end = kind.len();
         let instrument_end = kind_end + 1 + instrument.len();
         Self {
@@ -152,6 +153,9 @@ mod tests {
 
     #[test]
     fn display() {
-        assert_eq!(Channel::book("BTC-PERPETUAL").to_string(), "book.BTC-PERPETUAL.100ms");
+        assert_eq!(
+            Channel::book("BTC-PERPETUAL").to_string(),
+            "book.BTC-PERPETUAL.100ms"
+        );
     }
 }

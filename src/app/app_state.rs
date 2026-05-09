@@ -1,5 +1,7 @@
 use std::sync::Arc;
+
 use dashmap::DashMap;
+
 use crate::{
     common::{config::Config, error::AppResult},
     deribit::{channel::Channel, client::DeribitClient},
@@ -9,7 +11,7 @@ use crate::{
 pub struct AppState {
     pub config: Config,
     pub deribit_client: Arc<DeribitClient>,
-    order_book_managers: DashMap<Channel, Arc<BookManager>>
+    order_book_managers: DashMap<Channel, Arc<BookManager>>,
 }
 
 impl AppState {
@@ -28,8 +30,11 @@ impl AppState {
         if let Some(manager) = self.order_book_managers.get(&channel) {
             return Ok(Arc::clone(&*manager));
         }
-        let manager = Arc::new(BookManager::new(Arc::clone(&self.deribit_client), channel.clone()).await?);
-        self.order_book_managers.entry(channel).or_insert_with(|| Arc::clone(&manager));
+        let manager =
+            Arc::new(BookManager::new(Arc::clone(&self.deribit_client), channel.clone()).await?);
+        self.order_book_managers
+            .entry(channel)
+            .or_insert_with(|| Arc::clone(&manager));
         Ok(manager)
     }
 

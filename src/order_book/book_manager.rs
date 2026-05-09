@@ -27,7 +27,7 @@ enum BookStreamReason {
 
 pub struct BookManager {
     channel: Channel,
-    book_tx: broadcast::Sender<Book>,
+    book_tx: broadcast::Sender<Arc<Book>>,
     book: Arc<RwLock<Book>>,
     snapshot_rx: watch::Receiver<bool>,
     task: JoinHandle<()>,
@@ -36,7 +36,7 @@ pub struct BookManager {
 impl BookManager {
     pub async fn new(client: Arc<DeribitClient>, channel: Channel) -> AppResult<Self> {
         let book = Arc::new(RwLock::new(Book::new()));
-        let (book_tx, _) = broadcast::channel(128);
+        let (book_tx, _) = broadcast::channel::<Arc<Book>>(128);
         let (snapshot_tx, snapshot_rx) = watch::channel(false);
         let task = tokio::spawn(Self::maintain_book_state(
             Arc::clone(&client),
@@ -75,7 +75,7 @@ impl BookManager {
     pub fn subscribe_book(
         self: &Arc<Self>,
         connection_id: Uuid,
-    ) -> AppResult<SubscriptionStream<Book>> {
+    ) -> AppResult<SubscriptionStream<Arc<Book>>> {
         Ok(SubscriptionStream::new(
             self.book_tx.subscribe(),
             self.channel.clone(),
@@ -89,7 +89,7 @@ impl BookManager {
         client: Arc<DeribitClient>,
         channel: Channel,
         book: Arc<RwLock<Book>>,
-        book_tx: broadcast::Sender<Book>,
+        book_tx: broadcast::Sender<Arc<Book>>,
         snapshot_tx: watch::Sender<bool>,
     ) {
         let mut backoff = ExponentialBackoffBuilder::new()
@@ -140,7 +140,7 @@ impl BookManager {
     async fn handle_book_stream(
         channel: &Channel,
         book: &Arc<RwLock<Book>>,
-        book_tx: &broadcast::Sender<Book>,
+        book_tx: &broadcast::Sender<Arc<Book>>,
         snapshot_tx: &watch::Sender<bool>,
         backoff: &mut backoff::exponential::ExponentialBackoff<SystemClock>,
         stream: &mut SubscriptionStream<OrderBookUpdateMessage>,
@@ -192,7 +192,7 @@ impl BookManager {
                                 debug!(%channel, change_id = update.change_id, "Order book updated");
 
                                 if book_tx.receiver_count() > 0 {
-                                    if let Err(e) = book_tx.send(book.clone()) {
+                                    if let Err(e) = book_tx.send(Arc::new(book.clone())) {
                                         warn!(%channel, "Failed to broadcast update: {}", e);
                                     }
                                 }

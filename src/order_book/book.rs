@@ -246,7 +246,6 @@ mod tests {
 
     #[test]
     fn price_distinct_fractional() {
-        // fixed-point must distinguish these — old truncation bug would make them equal
         assert_ne!(Price::from_f64(80258.0), Price::from_f64(80258.5));
     }
 

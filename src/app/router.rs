@@ -130,7 +130,7 @@ async fn stream_book(
         .subscribe_book(connection_id)?
         .map(move |result| {
             result.and_then(|item| {
-                Event::default().json_data(item).map_err(|e| {
+                Event::default().json_data(&*item).map_err(|e| {
                     AppError::InternalError(format!(
                         "Error on order book subscription {}",
                         e.to_string()
