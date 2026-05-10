@@ -155,7 +155,7 @@ async fn scenario_read_under_contention() {
         }));
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     stop.store(true, Ordering::Relaxed);
 
     let write_count = writer.await.unwrap();
