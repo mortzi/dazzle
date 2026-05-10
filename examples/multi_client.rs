@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let mut count = 0;
                     while let Some(chunk) = stream.next().await {
                         match chunk {
-                            Ok(bytes) => {
+                            Ok(_bytes) => {
                                 count += 1;
                                 if count % 10 == 0 {
                                     info!(instrument, count, "stream chunks received");

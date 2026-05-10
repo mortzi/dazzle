@@ -6,13 +6,19 @@ use std::{
     time::Instant,
 };
 
-use hdrhistogram::Histogram;
-use tokio::sync::RwLock;
-
 use dazzle::{
     deribit::models::{BookLevel, BookUpdateType, OrderBookUpdate},
     order_book::book::{Book, Price, Quantity, Side},
 };
+use hdrhistogram::Histogram;
+use tokio::sync::RwLock;
+
+#[tokio::main]
+async fn main() {
+    scenario_update_throughput().await;
+    scenario_read_under_contention().await;
+    scenario_walk_scaling().await;
+}
 
 fn make_snapshot(depth: usize) -> OrderBookUpdate {
     OrderBookUpdate {
@@ -22,10 +28,18 @@ fn make_snapshot(depth: usize) -> OrderBookUpdate {
         prev_change_id: None,
         update_type: BookUpdateType::Snapshot,
         asks: (0..depth)
-            .map(|i| BookLevel { action: "new".into(), price: 80000.0 + i as f64 * 0.5, size: 1.0 })
+            .map(|i| BookLevel {
+                action: "new".into(),
+                price: 80000.0 + i as f64 * 0.5,
+                size: 1.0,
+            })
             .collect(),
         bids: (0..depth)
-            .map(|i| BookLevel { action: "new".into(), price: 79999.5 - i as f64 * 0.5, size: 1.0 })
+            .map(|i| BookLevel {
+                action: "new".into(),
+                price: 79999.5 - i as f64 * 0.5,
+                size: 1.0,
+            })
             .collect(),
     }
 }
@@ -91,7 +105,9 @@ async fn scenario_update_throughput() {
 // ─── Scenario 2: read latency under write contention ─────────────────────────
 
 async fn scenario_read_under_contention() {
-    println!("\n=== Scenario 2: Read latency under write contention (depth=100, 10 readers, 2s) ===");
+    println!(
+        "\n=== Scenario 2: Read latency under write contention (depth=100, 10 readers, 2s) ==="
+    );
 
     let book = Arc::new(RwLock::new(Book::from_snapshot(&make_snapshot(100))));
     let stop = Arc::new(AtomicBool::new(false));
@@ -139,7 +155,7 @@ async fn scenario_read_under_contention() {
         }));
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     stop.store(true, Ordering::Relaxed);
 
     let write_count = writer.await.unwrap();
@@ -166,17 +182,11 @@ async fn scenario_walk_scaling() {
         for _ in 0..50_000 {
             let t = Instant::now();
             let _ = book.walk_book(Side::Buy, qty);
-            hist.record(t.elapsed().as_nanos().max(1) as u64).unwrap_or(());
+            hist.record(t.elapsed().as_nanos().max(1) as u64)
+                .unwrap_or(());
         }
 
         println!("depth={depth:>3}");
         print_hist("walk_book", &hist);
     }
-}
-
-#[tokio::main]
-async fn main() {
-    scenario_update_throughput().await;
-    scenario_read_under_contention().await;
-    scenario_walk_scaling().await;
 }
