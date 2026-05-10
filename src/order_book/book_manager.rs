@@ -146,9 +146,9 @@ impl BookManager {
         stream: &mut SubscriptionStream<OrderBookUpdateMessage>,
     ) -> BookStreamReason {
         loop {
-            match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            match tokio::time::timeout(Duration::from_secs(45), stream.next()).await {
                 Err(_elapsed) => {
-                    warn!(%channel, "Order book stream timed out — no message in 30s");
+                    warn!(%channel, "Order book stream timed out — no message in 45s");
                     return BookStreamReason::StreamEnded;
                 }
                 Ok(None) => {
