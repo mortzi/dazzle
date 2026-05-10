@@ -168,31 +168,35 @@ impl BookManager {
                                 info!(%channel, "Order book snapshot received, streaming updates");
                             }
                             BookUpdateType::Change => {
-                                let mut book = book.write().await;
+                                {
+                                    let mut book = book.write().await;
 
-                                if let Some(prev_id) = update.prev_change_id {
-                                    if prev_id != book.change_id {
-                                        warn!(
-                                            %channel,
-                                            expected = book.change_id,
-                                            got = prev_id,
-                                            "Order book gap detected, resubscribing"
-                                        );
-                                        return BookStreamReason::StreamEnded;
+                                    if let Some(prev_id) = update.prev_change_id {
+                                        if prev_id != book.change_id {
+                                            warn!(
+                                                %channel,
+                                                expected = book.change_id,
+                                                got = prev_id,
+                                                "Order book gap detected, resubscribing"
+                                            );
+                                            return BookStreamReason::StreamEnded;
+                                        }
                                     }
-                                }
 
-                                book.change_id = update.change_id;
-                                for level in &update.asks {
-                                    apply_level(&mut book.asks, level);
+                                    book.change_id = update.change_id;
+                                    for level in &update.asks {
+                                        apply_level(&mut book.asks, level);
+                                    }
+                                    for level in &update.bids {
+                                        apply_level(&mut book.bids, level);
+                                    }
+                                    debug!(%channel, change_id = update.change_id, "Order book updated");
                                 }
-                                for level in &update.bids {
-                                    apply_level(&mut book.bids, level);
-                                }
-                                debug!(%channel, change_id = update.change_id, "Order book updated");
 
                                 if book_tx.receiver_count() > 0 {
-                                    if let Err(e) = book_tx.send(Arc::new(book.clone())) {
+                                    if let Err(e) =
+                                        book_tx.send(Arc::new(book.read().await.clone()))
+                                    {
                                         warn!(%channel, "Failed to broadcast update: {}", e);
                                     }
                                 }
@@ -238,14 +242,21 @@ mod tests {
     use crate::deribit::models::BookLevel;
 
     fn level(action: &str, price: f64, size: f64) -> BookLevel {
-        BookLevel { action: action.into(), price, size }
+        BookLevel {
+            action: action.into(),
+            price,
+            size,
+        }
     }
 
     #[test]
     fn apply_level_new() {
         let mut levels = BTreeMap::new();
         apply_level(&mut levels, &level("new", 100.0, 5.0));
-        assert_eq!(levels.get(&Price::from_f64(100.0)), Some(&Quantity::from_f64(5.0)));
+        assert_eq!(
+            levels.get(&Price::from_f64(100.0)),
+            Some(&Quantity::from_f64(5.0))
+        );
     }
 
     #[test]
@@ -253,7 +264,10 @@ mod tests {
         let mut levels = BTreeMap::new();
         apply_level(&mut levels, &level("new", 100.0, 5.0));
         apply_level(&mut levels, &level("change", 100.0, 3.0));
-        assert_eq!(levels.get(&Price::from_f64(100.0)), Some(&Quantity::from_f64(3.0)));
+        assert_eq!(
+            levels.get(&Price::from_f64(100.0)),
+            Some(&Quantity::from_f64(3.0))
+        );
     }
 
     #[test]
